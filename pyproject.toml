@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elastic"
+version = "0.1.0"
+description = "ELASTIC: NVMe-offload batched LLM inference for UMA machines with KV/activation hybrid caching"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "elastic contributors" }]
+
+dependencies = [
+    "numpy>=1.25",
+    "torch>=2.4",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.3"]
+campaign = ["pandas>=2.0", "nbformat>=5.0"]
+
+[project.scripts]
+elastic = "elastic.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["elastic*"]
+exclude = ["elastic.tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["elastic"]
+python_files = ["test_*.py"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

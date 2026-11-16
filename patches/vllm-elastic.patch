@@ -1,0 +1,712 @@
+diff --git a/vllm/model_executor/models/bloom.py b/vllm/model_executor/models/bloom.py
+index 233028a90..05683c3e9 100644
+--- a/vllm/model_executor/models/bloom.py
++++ b/vllm/model_executor/models/bloom.py
+@@ -61,26 +61,33 @@ from .utils import (
+ 
+ 
+ def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
+-    closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
+-    base = torch.tensor(
+-        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
+-        dtype=torch.float32,
+-    )
+-    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
+-    slopes = torch.pow(base, powers)
+-
+-    if closest_power_of_2 != total_num_heads:
+-        extra_base = torch.tensor(
+-            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
++    # elastic: force CPU so this runs under StreamingModelLoader's
++    # `torch.device("meta")` init context. ALiBi slopes are config-derived
++    # constants (not weights), and `.tolist()` on them in BloomAttention
++    # cannot copy out of a meta tensor — computing them on CPU at init is
++    # correct and tiny.
++    with torch.device("cpu"):
++        closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
++        base = torch.tensor(
++            2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
+             dtype=torch.float32,
+         )
+-        num_remaining_heads = min(
+-            closest_power_of_2, total_num_heads - closest_power_of_2
+-        )
+-        extra_powers = torch.arange(
+-            start=1, end=1 + 2 * num_remaining_heads, step=2, dtype=torch.int32
+-        )
+-        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
++        powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
++        slopes = torch.pow(base, powers)
++
++        if closest_power_of_2 != total_num_heads:
++            extra_base = torch.tensor(
++                2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
++                dtype=torch.float32,
++            )
++            num_remaining_heads = min(
++                closest_power_of_2, total_num_heads - closest_power_of_2
++            )
++            extra_powers = torch.arange(
++                start=1, end=1 + 2 * num_remaining_heads, step=2, dtype=torch.int32
++            )
++            slopes = torch.cat(
++                [slopes, torch.pow(extra_base, extra_powers)], dim=0)
+     return slopes
+ 
+ 
+@@ -207,8 +214,27 @@ class BloomBlock(nn.Module):
+         position_ids: torch.Tensor,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
++        # elastic: the streaming loader attaches the same four attribute
++        # callbacks as on OPTDecoderLayer. _elastic_pre waits for the slot
++        # holding this layer's weights; _elastic_capture_ln owns input_layernorm
++        # — the identical LN (aten .out) lands in the layer's DMA-registered
++        # activation buffer and the returned view feeds query_key_value;
++        # _elastic_attn_done enqueues a prefill's KV save once self-attention
++        # has cached the K/V; _elastic_post stamps the layer end on the slot
++        # (done_seq, forward_done_visit) and marks it on the stream, and the
++        # writeback releases the slot once that mark passes and the layer's
++        # writes land. BLOOM's prefill is the plain whole-batch layer loop (no
++        # x-wheel). Unset under stock vLLM.
++        cb = getattr(self, "_elastic_pre", None)
++        if cb is not None:
++            cb(self)
++
+         # Layer norm at the beginning of the transformer layer.
+-        layernorm_output = self.input_layernorm(hidden_states)
++        cap = getattr(self, "_elastic_capture_ln", None)
++        if cap is not None:
++            layernorm_output = cap(self, hidden_states)
++        else:
++            layernorm_output = self.input_layernorm(hidden_states)
+ 
+         # Layer norm post the self attention.
+         if self.apply_residual_connection_post_layernorm:
+@@ -221,6 +247,11 @@ class BloomBlock(nn.Module):
+             position_ids=position_ids,
+             hidden_states=layernorm_output,
+         )
++        # elastic (prefill only): the K/V is final in the cache pages; the
++        # KV save is enqueued here.
++        cb = getattr(self, "_elastic_attn_done", None)
++        if cb is not None:
++            cb(self)
+         attention_output = attention_output + residual
+         layernorm_output = self.post_attention_layernorm(attention_output)
+ 
+@@ -232,6 +263,9 @@ class BloomBlock(nn.Module):
+ 
+         # MLP.
+         output = self.mlp(layernorm_output) + residual
++        cb = getattr(self, "_elastic_post", None)
++        if cb is not None:
++            cb(self)
+         return output
+ 
+ 
+diff --git a/vllm/model_executor/models/opt.py b/vllm/model_executor/models/opt.py
+index 81653b951..1adee9d22 100644
+--- a/vllm/model_executor/models/opt.py
++++ b/vllm/model_executor/models/opt.py
+@@ -171,16 +171,75 @@ class OPTDecoderLayer(nn.Module):
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
++        # elastic: the streaming loader attaches four attribute callbacks to
++        # every decoder layer — _elastic_pre (waits for this layer's weights),
++        # _elastic_capture_ln (the pre-attention LN), _elastic_attn_done (right
++        # after self_attn) and _elastic_post (the layer end: it stamps the slot
++        # with done_seq / forward_done_visit and marks the stream; the writeback
++        # releases the slot once that mark passes and the layer's writes land).
++        # Attribute callbacks rather than forward hooks put each call at an
++        # exact point inside the layer. Unset under stock vLLM.
++        cb = getattr(self, "_elastic_pre", None)
++        if cb is not None:
++            cb(self)
++        hidden_states = self._elastic_body(hidden_states)
++        cb = getattr(self, "_elastic_post", None)
++        if cb is not None:
++            cb(self)
++        return hidden_states
++
++    def _elastic_body(
++        self,
++        hidden_states: torch.Tensor,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        # The attention + FFN body. forward wraps it in the pre/post
++        # callbacks; the zig-zag prefill
++        # (OPTDecoder._elastic_zigzag_prefill) calls the pre/post
++        # callbacks itself, once per layer, and this body once per
++        # GPU batch, after narrowing the forward-context attn_metadata /
++        # slot_mapping to that GPU batch, so self_attn runs vLLM's kernel
++        # over exactly its sequences.
+         # Self Attention
+-        residual = hidden_states
+-        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
+-        if self.do_layer_norm_before:
+-            hidden_states = self.self_attn_layer_norm(hidden_states)
+-        hidden_states = self.self_attn(hidden_states=hidden_states)
+-        hidden_states = residual + hidden_states
+-        # 350m applies layer norm AFTER attention
+-        if not self.do_layer_norm_before:
+-            hidden_states = self.self_attn_layer_norm(hidden_states)
++        _xwc = getattr(self, "_elastic_xw_ctx", None)
++        if _xwc is not None:
++            # elastic x-wheel (zig-zag prefill): the caller (prep_span) copied
++            # this span's pre-LN x to a transient — `_res`, the exact
++            # skip-connection operand — and LN'd that copy into the activation
++            # buffer rows, so `hidden_states` is the post-LN y: the bytes
++            # the ACT save DMA-reads, which nothing here mutates.
++            _res = _xwc
++            hidden_states = self.self_attn(hidden_states=hidden_states)
++            # The QKV projection and reshape_and_cache above made this
++            # span's K/V final in the cache pages, so the span's KV save is
++            # enqueued here; a span's write order is ACT → K → V.
++            self._elastic_attn_done(self)
++            hidden_states = _res + hidden_states
++        else:
++            residual = hidden_states
++            # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
++            if self.do_layer_norm_before:
++                # elastic: the ACT capture owns this LayerNorm. It computes
++                # the identical LN (aten .out) into the layer's
++                # DMA-registered activation buffer and returns that view, which
++                # the ACT save reads in place. Stock LN otherwise.
++                cap = getattr(self, "_elastic_capture_ln", None)
++                if cap is not None:
++                    hidden_states = cap(self, hidden_states)
++                else:
++                    hidden_states = self.self_attn_layer_norm(hidden_states)
++
++            hidden_states = self.self_attn(hidden_states=hidden_states)
++            # elastic (prefill only): reshape_and_cache inside self_attn made
++            # this span's K/V final in the cache pages; the span's KV save is
++            # enqueued here.
++            cb = getattr(self, "_elastic_attn_done", None)
++            if cb is not None:
++                cb(self)
++            hidden_states = residual + hidden_states
++            # 350m applies layer norm AFTER attention
++            if not self.do_layer_norm_before:
++                hidden_states = self.self_attn_layer_norm(hidden_states)
+ 
+         # Fully Connected
+         residual = hidden_states
+@@ -190,6 +249,17 @@ class OPTDecoderLayer(nn.Module):
+         hidden_states, _ = self.fc1(hidden_states)
+         hidden_states = self.activation_fn(hidden_states)
+         hidden_states, _ = self.fc2(hidden_states)
++        # `out`: land the layer's result directly in the caller's buffer. The
++        # zig-zag prefill passes the next layer's activation-buffer rows, so
++        # the layer writes its result there with no torch tensor in between
++        # — allocating one and having the caller copy it is a whole-batch
++        # read+write per layer through the one allocator ELASTIC does not own.
++        # The last layer has no next activation buffer; it lands in the span's
++        # own transient, which the attention's residual add has finished with.
++        # Only the zig-zag prefill passes `out`, and it serves pre-norm models
++        # only, where the final residual add IS the layer's last op.
++        if out is not None:
++            return torch.add(residual, hidden_states, out=out)
+         hidden_states = residual + hidden_states
+         # 350m applies layer norm AFTER attention
+         if not self.do_layer_norm_before:
+@@ -198,6 +268,8 @@ class OPTDecoderLayer(nn.Module):
+ 
+ 
+ class OPTDecoder(nn.Module):
++    _zigzag_beacon = False
++
+     def __init__(
+         self,
+         config: OPTConfig,
+@@ -272,6 +344,17 @@ class OPTDecoder(nn.Module):
+         intermediate_tensors: IntermediateTensors | None,
+         inputs_embeds: torch.Tensor | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
++        layers = list(islice(self.layers, self.start_layer, self.end_layer))
++        # elastic: a prefill step whose batch spans more than one GPU batch
++        # (the gate's host-side groups) is the zig-zag prefill. It returns
++        # the final-normed last row of every sequence, one row per logits
++        # index, which is all the sampler reads.
++        _xw = getattr(self, "_elastic_xw", None)
++        if _xw is not None and _xw.prefill():
++            groups = _xw.gpu_batches()
++            if groups is not None:
++                return self._elastic_zigzag_prefill(input_ids, positions,
++                                                         layers, groups)
+         if get_pp_group().is_first_rank:
+             if inputs_embeds is None:
+                 inputs_embeds = self.embed_input_ids(input_ids)
+@@ -279,11 +362,12 @@ class OPTDecoder(nn.Module):
+             if self.project_in is not None:
+                 inputs_embeds, _ = self.project_in(inputs_embeds)
+             hidden_states = inputs_embeds + pos_embeds
++            del inputs_embeds, pos_embeds
+         else:
+             assert intermediate_tensors is not None
+             hidden_states = intermediate_tensors["hidden_states"]
+ 
+-        for layer in islice(self.layers, self.start_layer, self.end_layer):
++        for layer in layers:
+             hidden_states = layer(hidden_states)
+ 
+         if not get_pp_group().is_last_rank:
+@@ -294,6 +378,104 @@ class OPTDecoder(nn.Module):
+             hidden_states, _ = self.project_out(hidden_states)
+         return hidden_states
+ 
++    def _elastic_zigzag_prefill(self, input_ids, positions, layers,
++                                     groups):
++        """Zig-zag prefill (x-wheel): for each layer, hold the slot with its
++        streamed weights ONCE (_elastic_pre / _elastic_post wrap the whole
++        GPU-batch loop) and pass every GPU batch through the layer body,
++        narrowing the forward-context attn_metadata / slot_mapping to each GPU
++        batch so vLLM's Attention kernel writes/reads exactly its KV slots.
++        `groups` are the gate's whole-sequence GPU batches, (g0, g1, t0, t1)
++        each. Bit-identical to the batch-outer loop (each prefill sequence's
++        attention is self-contained), but each layer's weight is streamed once
++        for the whole batch. Saves leave at their production points: a span's
++        ACT at its LN (prep_span), its complete KV blocks at the attn seam, the
++        rows' mutable prompt blocks at the layer end (_elastic_post).
++
++        The residual stream lives IN the activation buffers, PRE-LN: the
++        embedding lands plain in act_buffer(0) and each layer's span output in
++        act_buffer(p+1) via out=, so no whole-batch [T,d] residual buffer exists
++        anywhere. The last layer lands each span's output in the span transient
++        instead, and only every sequence's last row goes on: it is gathered into
++        `last` (N_seq rows), final-normed, and returned — the rows the sampler
++        reads."""
++        import dataclasses
++
++        from vllm.forward_context import get_forward_context
++
++        fctx = get_forward_context()
++        meta_map = fctx.attn_metadata
++        sm_map = fctx.slot_mapping
++        _xw = self._elastic_xw
++        _d = int(self.config.hidden_size)
++        _dt = self.embed_positions.weight.dtype
++        _nl = len(layers)
++        # Every sequence's last row out of the last layer, in sequence order.
++        last = torch.empty((groups[-1][1], _d), device=input_ids.device,
++                           dtype=_dt)
++        if not OPTDecoder._zigzag_beacon:
++            OPTDecoder._zigzag_beacon = True
++            import sys as _sys
++
++            print(f"[ELASTIC] layer-outer prefill ACTIVE "
++                  f"T={input_ids.shape[0]} n_mb={len(groups)} "
++                  f"n_layers={len(layers)}",
++                  file=_sys.stderr, flush=True)
++        for _p, layer in enumerate(layers):
++            layer._elastic_pre(layer)
++            if _p == 0:
++                # The embedding, per GPU batch, into layer 0's activation
++                # buffer — layer 0's only once its visit is published, i.e.
++                # after its pre callback. Layer 0's LN happens at its own spans.
++                for (_g0, _g1, t0, t1) in groups:
++                    _e = self.embed_input_ids(input_ids[t0:t1])
++                    _e = _e + self.embed_positions(positions[t0:t1])
++                    _xw.fill_embed(_e, t0, t1)
++                    del _e
++            ln = layer.self_attn.attn.layer_name
++            full = meta_map[ln]
++            full_sm = sm_map[ln]
++            qsl = full.query_start_loc
++            seq_lens = full.seq_lens
++            block_table = full.block_table
++            for (g0, g1, t0, t1) in groups:
++                meta_map[ln] = dataclasses.replace(
++                    full,
++                    num_actual_tokens=t1 - t0,
++                    query_start_loc=qsl[g0:g1 + 1] - qsl[g0],
++                    seq_lens=seq_lens[g0:g1],
++                    block_table=block_table[g0:g1],
++                    scheduler_metadata=None,
++                    prefix_scheduler_metadata=None,
++                )
++                sm_map[ln] = full_sm[t0:t1]
++                # The span: the attn seam selects this GPU batch's rows of the
++                # full flat batch by it (GPU batches are whole-seq, so no
++                # (seq,block) run straddles a span).
++                layer._elastic_gpu_batch_span = (t0, t1)
++                # prep_span copies the span's PRE-LN x to a transient and
++                # LNs the copy into act_buffer(p) (which thereby holds the ACT
++                # the save DMA-reads — enqueued right there); the body lands
++                # its final residual add straight in act_buffer(p+1) via out=.
++                _y, _res = _xw.prep_span(_p, t0, t1, _d, _dt)
++                layer._elastic_xw_ctx = _res
++                if _p + 1 < _nl:
++                    layer._elastic_body(
++                        _y, out=_xw.land_view(_p, t0, t1, _d, _dt))
++                else:
++                    # The last layer lands in the span transient: after the
++                    # attention's residual add nothing reads it, and the
++                    # span's sequences' last rows are gathered out of it
++                    # before the next span's prep_span refills it.
++                    layer._elastic_body(_y, out=_res)
++                    torch.index_select(_res, 0, qsl[g0 + 1:g1 + 1] - 1 - t0,
++                                       out=last[g0:g1])
++                layer._elastic_xw_ctx = None
++                del _y, _res
++            layer._elastic_gpu_batch_span = None
++            layer._elastic_post(layer)
++        return self.final_layer_norm(last)
++
+ 
+ @support_torch_compile
+ class OPTModel(nn.Module):
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index 4b8b86d86..67666795e 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -34,6 +34,17 @@ from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
++import sys as _sys
++
++
++def _elastic_arrival_module():
++    """The elastic arrival-based attention module, if the elastic
++    streaming loader has installed it in this process; None under stock
++    vLLM. The module is looked up rather than imported so a vanilla run
++    never pulls the elastic runtime in."""
++    return _sys.modules.get("elastic.vllm_runtime.arrival_attention")
++
++
+ if is_flash_attn_varlen_func_available():
+     from vllm.v1.attention.backends.fa_utils import (
+         flash_attn_supports_sinks,
+@@ -616,7 +627,16 @@ class FlashAttentionImpl(AttentionImpl):
+         self.scale = float(scale)
+         self.num_kv_heads = num_kv_heads
+         if alibi_slopes is not None:
+-            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
++            # elastic: pin to a real device. StreamingModelLoader builds the
++            # model under `torch.device("meta")`, and without an explicit
++            # device this turns the (config-constant) slopes into a valueless
++            # meta tensor stored as a plain attr — invisible to the streaming
++            # loader's param/buffer materialisation and fatal at forward
++            # (flash_attn_varlen_func has no meta kernel). CUDA is the query
++            # device the kernel runs on and is the default in non-meta init,
++            # so this is a no-op for normal vLLM.
++            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32,
++                                        device="cuda")
+         self.alibi_slopes = alibi_slopes
+         if sliding_window is None:
+             self.sliding_window = (-1, -1)
+@@ -806,6 +826,49 @@ class FlashAttentionImpl(AttentionImpl):
+                     if self.sliding_window is not None
+                     else None
+                 )
++                # ELASTIC: in a decode step the new token goes into its
++                # block once that block has arrived — the consumer calls this
++                # for the rows whose current blocks a batch delivered, before
++                # attending them. Built here where key/value/slot_mapping live.
++                # The rows are chosen in the slot map, not by copying them out
++                # of key/value: every other row's slot is -1, which the cache
++                # kernel skips.
++                def _elastic_append(rows):
++                    _kc, _vc = kv_cache.unbind(0)
++                    _sm = attn_metadata.slot_mapping
++                    _rsm = torch.full_like(_sm, -1)
++                    _rsm.index_copy_(0, rows, _sm.index_select(0, rows))
++                    reshape_and_cache_flash(
++                        key,
++                        value,
++                        _kc,
++                        _vc,
++                        _rsm,
++                        self.kv_cache_dtype,
++                        layer._k_scale,
++                        layer._v_scale,
++                    )
++
++                _arr_mod = _elastic_arrival_module()
++                if _arr_mod is not None:
++                    # Elastic arrival-based attention seam. Not wrapped in
++                    # try/except: a broken ctx must crash rather than fall
++                    # back silently to the monolithic call.
++                    _arr_ctx = _arr_mod.get_arrival_ctx()
++                    if _arr_ctx is not None:
++                        # Decode: consume in arrival order. arrival_decode
++                        # passes alibi_slopes to every partial call and applies
++                        # the exact per-run ALiBi LSE shift before merging.
++                        _arr_mod.arrival_decode(
++                            query[:num_actual_tokens],
++                            output[:num_actual_tokens],
++                            key_cache, value_cache,
++                            scale=self.scale,
++                            ctx=_arr_ctx,
++                            alibi_slopes=self.alibi_slopes,
++                            append_cb=_elastic_append,
++                        )
++                        return output
+                 flash_attn_varlen_func(
+                     q=query[:num_actual_tokens],
+                     k=key_cache,
+@@ -872,6 +935,11 @@ class FlashAttentionImpl(AttentionImpl):
+             # For encoder attention,
+             # we use direct Q, K, V tensors without caching
+             return
++        # ELASTIC: a decode step's blocks are still being reloaded into this
++        # cache; the new token goes in after its block arrives (arrival_decode).
++        _arr_mod = _elastic_arrival_module()
++        if _arr_mod is not None and _arr_mod.get_arrival_ctx() is not None:
++            return
+ 
+         # Scatter write into the KV cache using slot_mapping indices.
+         # No TMA kernel is invoked here, so stride canonicalization is not needed.
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index a30e9275b..24987728b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -513,6 +513,16 @@ class GPUModelRunner(
+         # self.model: nn.Module  # Set after load_model
+         # Initialize in initialize_kv_cache
+         self.kv_caches: list[torch.Tensor] = []
++        # ELASTIC (elastic_streaming): the arrival gate its model loader
++        # attaches once the KV caches exist, and the per-layer slot mappings and
++        # block tables the gate returns for each step. None under stock vLLM.
++        self._kv_arrival_gate = None
++        self._elastic_slot_mappings_by_layer: dict[str, torch.Tensor] | None = (
++            None
++        )
++        self._elastic_block_tables_by_layer: dict[str, torch.Tensor] | None = (
++            None
++        )
+         # Initialize in initialize_kv_cache_tensors
+         self.cross_layers_kv_cache: torch.Tensor | None = None
+         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
+@@ -736,10 +746,21 @@ class GPUModelRunner(
+         # Because inputs_embeds may be bfloat16 and we don't need a numpy
+         # version of this tensor, avoid a RuntimeError by not creating a
+         # numpy buffer.
+-        self.inputs_embeds = self._make_buffer(
+-            self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
+-        )
+-        self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
++        # ELASTIC: only a multimodal model or prompt embeds read these two
++        # (every reader sits under one of the two flags), so a text-only
++        # model does not allocate them. inputs_embeds is max_num_tokens ×
++        # hidden, and a whole-batch prefill step sets max_num_tokens to
++        # max_num_seqs · max_model_len.
++        if self.supports_mm_inputs or self.enable_prompt_embeds:
++            self.inputs_embeds = self._make_buffer(
++                self.max_num_tokens,
++                self.inputs_embeds_size,
++                dtype=self.dtype,
++                numpy=False,
++            )
++            self.is_token_ids = self._make_buffer(
++                self.max_num_tokens, dtype=torch.bool
++            )
+         self.discard_request_mask = self._make_buffer(
+             self.max_num_reqs, dtype=torch.bool
+         )
+@@ -2345,8 +2366,21 @@ class GPUModelRunner(
+                 assert isinstance(attn_metadata, list)
+                 attn_metadata_dict = attn_metadata[ubid]
+ 
++            # ELASTIC: a block's position is per layer (see
++            # `_get_slot_mappings`), so the group's metadata is copied per
++            # layer with that layer's slot mapping and block table; the
++            # prefill's attention reads the K/V back through the table.
++            _pl_sm = self._elastic_slot_mappings_by_layer
++            _pl_bt = self._elastic_block_tables_by_layer
+             for layer_name in attn_group.layer_names:
+-                attn_metadata_dict[layer_name] = attn_metadata_i
++                if _pl_sm is not None:
++                    attn_metadata_dict[layer_name] = replace(
++                        attn_metadata_i,
++                        slot_mapping=_pl_sm[layer_name],
++                        block_table=_pl_bt[layer_name],
++                    )
++                else:
++                    attn_metadata_dict[layer_name] = attn_metadata_i
+ 
+         # Prepare the attention metadata for each KV cache group and make layers
+         # in the same group share the same metadata.
+@@ -3883,6 +3917,17 @@ class GPUModelRunner(
+             for layer_name in kv_cache_group.layer_names:
+                 slot_mappings_by_layer[layer_name] = slot_mapping
+ 
++        # ELASTIC: the arrival gate the elastic_streaming loader attaches
++        # builds this step's rows (opening the batch at its prefill step)
++        # and returns the step's per-layer slot mappings and block tables
++        # (a block's position is per layer). None under stock vLLM.
++        if self._kv_arrival_gate is not None:
++            slot_mappings_by_layer, _bt_by_layer = self._kv_arrival_gate(
++                slot_mappings_by_gid
++            )
++            self._elastic_slot_mappings_by_layer = slot_mappings_by_layer
++            self._elastic_block_tables_by_layer = _bt_by_layer
++
+         if ubatch_slices is not None:
+             result: list[dict[str, torch.Tensor]] = []
+             for ubatch in ubatch_slices:
+@@ -4199,7 +4244,15 @@ class GPUModelRunner(
+                         kv_connector_output,
+                     )
+ 
+-                sample_hidden_states = hidden_states[logits_indices]
++                # ELASTIC: the zig-zag prefill returns one row per
++                # sequence (its last token's), which is already one row per
++                # logits index; so is a step where every request has one
++                # token, where the gather is the identity.
++                sample_hidden_states = (
++                    hidden_states
++                    if hidden_states.shape[0] == logits_indices.shape[0]
++                    else hidden_states[logits_indices]
++                )
+                 logits = self.model.compute_logits(sample_hidden_states)
+             else:
+                 # Rare case.
+@@ -6137,13 +6190,23 @@ class GPUModelRunner(
+         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
+         from vllm.v1.worker.workspace import reset_workspace_manager
+ 
+-        # Calls torch.accelerator.synchronize()
+-        self._cleanup_profiling_kv_cache()
+-        self.compilation_config.static_forward_context.clear()
+-        self.model = None  # type: ignore[assignment]
+-        _ROPE_DICT.clear()
++        # ELASTIC: the elastic_streaming loader stops its threads and lands
++        # its outstanding writes here, while the KV caches and buffers those
++        # threads touch are still alive. No-op under stock vLLM. A failure
++        # it raises still leaves the rest of the teardown to run.
++        _on_shutdown = getattr(getattr(self, "model", None),
++                               "_elastic_shutdown", None)
++        try:
++            if _on_shutdown is not None:
++                _on_shutdown()
++        finally:
++            # Calls torch.accelerator.synchronize()
++            self._cleanup_profiling_kv_cache()
++            self.compilation_config.static_forward_context.clear()
++            self.model = None  # type: ignore[assignment]
++            _ROPE_DICT.clear()
+ 
+-        reset_workspace_manager()
++            reset_workspace_manager()
+ 
+     def _cleanup_profiling_kv_cache(self) -> None:
+         torch.accelerator.synchronize()
+@@ -6771,13 +6834,57 @@ class GPUModelRunner(
+             dict[str, torch.Tensor]: A map between layer names to their
+             corresponding memory buffer for KV cache.
+         """
++        import os
++        # Under the elastic streaming loader the KV cache lives in
++        # host-registered (UMA) memory so the NVMe save/reload paths DMA
++        # straight from and into it; stock vLLM keeps its device allocation.
++        elastic_uma = (
++            str(getattr(self.vllm_config.load_config, "load_format", ""))
++            == "elastic_streaming"
++        )
++
+         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+-            tensor = torch.zeros(
+-                kv_cache_tensor.size, dtype=torch.int8, device=self.device
+-            )
+-            for layer_name in kv_cache_tensor.shared_by:
+-                kv_cache_raw_tensors[layer_name] = tensor
++        if elastic_uma:
++            # ELASTIC: allocate as cudaHostRegister'd host memory exposed
++            # as a CUDA view via UVA, so on UMA hardware the same physical
++            # RAM is both host- and device-accessible. Lets the NVMe save
++            # path read kv_caches bytes directly through `data_ptr()` without
++            # a D2H copy. The same allocation the streaming loader uses for
++            # its host-filled buffers (`_alloc_uma_buffer`: zeroed on the
++            # host, the refs kept alive in the list).
++            from elastic.vllm_runtime.streaming_loader import (
++                _alloc_uma_buffer,
++            )
++            from vllm.model_executor.models.utils import extract_layer_index
++
++            self._elastic_uma_kv_cache_buffers = []
++            # Rotating resident KV: n_slots physical buffers (ELASTIC_SLOTS,
++            # resolved by the streaming loader at load_model) instead of one
++            # per layer (the full KV working set, which does not fit at large
++            # batch). Every decoder layer's KV tensor has the same size.
++            # Layer li first aliases buffer li mod n_slots; that is only the
++            # initial enumeration — the rotation is per visit, and the loader
++            # (ReadRouter) re-points a layer's binding at every `acquire`
++            # (`_bind_kv_buffers`).
++            _tensors = list(kv_cache_config.kv_cache_tensors)
++            _n_slots = int(os.environ["ELASTIC_SLOTS"])
++            _kv_buffers = [
++                _alloc_uma_buffer(_tensors[0].size,
++                                  self._elastic_uma_kv_cache_buffers)
++                for _ in range(_n_slots)
++            ]
++            for t in _tensors:
++                cuda_t = _kv_buffers[extract_layer_index(t.shared_by[0])
++                                    % _n_slots]
++                for layer_name in t.shared_by:
++                    kv_cache_raw_tensors[layer_name] = cuda_t
++        else:
++            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
++                tensor = torch.zeros(
++                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
++                )
++                for layer_name in kv_cache_tensor.shared_by:
++                    kv_cache_raw_tensors[layer_name] = tensor
+ 
+         layer_names = set()
+         for group in kv_cache_config.kv_cache_groups:
+@@ -7102,6 +7209,13 @@ class GPUModelRunner(
+                 kv_transfer_group.register_kv_caches(kv_caches)
+             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+ 
++        # ELASTIC: the elastic_streaming model loader's callback takes the
++        # just-allocated per-layer kv_caches, starts its NVMe engine, writeback
++        # and loader, and attaches the arrival gate. No-op under stock vLLM.
++        _on_ready = getattr(self.model, "_elastic_on_kv_cache_ready", None)
++        if _on_ready is not None:
++            _on_ready(self)
++
+     def _get_attention_kv_cache_gid(self) -> int:
+         """Find the KV cache group index for attention layers.
+ 
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 53e62c925..538a7e3b5 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -363,6 +363,18 @@ class Worker(WorkerBase):
+             You may limit the usage of GPU memory
+             by adjusting the `gpu_memory_utilization` parameter.
+         """
++        if getattr(self.model_runner.model,
++                   "_elastic_on_kv_cache_ready", None) is not None:
++            # elastic streaming model: no profile forward. Its loader and
++            # writeback start only in `_elastic_on_kv_cache_ready`, after this
++            # call, and `_elastic_pre` waits for the slot holding the layer's
++            # weights with no timeout, so a forward here could never complete.
++            # The KV pool is sized via num_gpu_blocks_override, so the figure
++            # returned here is a placeholder that
++            # kv_cache_utils.may_override_num_blocks replaces, and the model
++            # runs eager, so no torch.compile / CUDA-graph capture needs the
++            # profile forward.
++            return int(self.requested_memory)
+         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+             # still need a profile run which compiles the model for
+             # max_num_batched_tokens
+@@ -687,7 +699,12 @@ class Worker(WorkerBase):
+         if self.use_v2_model_runner:
+             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
+             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+-        elif get_pp_group().is_last_rank:
++        elif (get_pp_group().is_last_rank
++              and getattr(self.model_runner.model,
++                          "_elastic_on_kv_cache_ready", None) is None):
++            # (Skipped for an elastic streaming model: every forward is a
++            # real step to its arrival gate, which would take a dummy step
++            # for a batch prefill, and to its slot rotation.)
+             # V1: Warm up sampler and preallocate memory buffer for logits and other
+             # sampling related tensors of max possible shape to avoid memory
+             # fragmentation issue.

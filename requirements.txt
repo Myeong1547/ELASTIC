@@ -1,0 +1,26 @@
+# elastic runtime requirements.
+#
+# Tested on Python 3.11+, CUDA ≥ 12.6, NVIDIA GB10 (sm_121).
+
+# Core numeric stack
+numpy>=1.25
+torch>=2.4                # CUDA build
+matplotlib>=3.7           # policy/cost plots
+
+# Model loading + tokenizer (stage_opt)
+transformers>=4.40
+
+# Campaign notebook (benchmarks/build_campaign_nb.py) and run_bench --alpha-curve
+pandas>=2.0
+nbformat>=5.0
+
+# Test harness
+pytest>=7.3
+
+# Runtime base (NOT pip-installable here): vLLM is upstream commit
+# bf610c2f56764e1b30bc6065f4ceace3d6e59036 with patches/vllm-elastic.patch
+# applied, installed editable from source (README.md, "Install") — do not
+# `pip install vllm` over it.
+
+# Build-time dep for the native loader (apt, not pip):
+#   liburing-dev        for libnvme_loader.so  (native_loader/)
